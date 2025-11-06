@@ -1,9 +1,56 @@
 import json
-import re
-import time
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+
+
+_JSON_DECODER = json.JSONDecoder()
+_SESSION_LOCK = threading.Lock()
+_SESSION_CACHE: Dict[str, requests.Session] = {}
+_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _decode_json(candidate: str) -> Optional[Any]:
+    try:
+        return json.loads(candidate)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_json_fragments(text: str) -> Any:
+    idx = 0
+    length = len(text)
+    while idx < length:
+        char = text[idx]
+        if char in "{[":
+            try:
+                fragment, end_index = _JSON_DECODER.raw_decode(text, idx)
+            except json.JSONDecodeError:
+                idx += 1
+            else:
+                yield fragment
+                idx = end_index
+                continue
+        idx += 1
+
+
+def _get_http_session(provider: str) -> requests.Session:
+    key = provider.lower()
+    with _SESSION_LOCK:
+        session = _SESSION_CACHE.get(key)
+        if session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _SESSION_CACHE[key] = session
+        return session
+
+
+def _should_retry(status_code: int) -> bool:
+    return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
 
 
 class DualAPILLMNode:
@@ -54,56 +101,21 @@ class DualAPILLMNode:
     FUNCTION = "execute_api_call"
     CATEGORY = "LLM/API"
 
-    def parse_json_from_response(self, text: str) -> Optional[Dict[str, Any]]:
+    def parse_json_from_response(self, text: str) -> Optional[Any]:
         """
-        Attempt to extract JSON objects from model responses using multiple strategies.
+        Attempt to extract JSON content from model responses with minimal overhead.
         """
         if not text:
             return None
 
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            pass
+        stripped = text.strip()
+        direct_match = _decode_json(stripped)
+        if direct_match is not None:
+            return direct_match
 
-        json_blocks = re.findall(r"```json\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE)
-        for block in json_blocks:
-            try:
-                return json.loads(block.strip())
-            except json.JSONDecodeError:
-                continue
-
-        code_blocks = re.findall(r"```\s*\n(.*?)\n```", text, re.DOTALL)
-        for block in code_blocks:
-            try:
-                return json.loads(block.strip())
-            except json.JSONDecodeError:
-                continue
-
-        json_patterns = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
-        for pattern in json_patterns:
-            try:
-                return json.loads(pattern.strip())
-            except json.JSONDecodeError:
-                continue
-
-        array_patterns = re.findall(r"\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]", text, re.DOTALL)
-        for pattern in array_patterns:
-            try:
-                return json.loads(pattern.strip())
-            except json.JSONDecodeError:
-                continue
-
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
-            if line.strip().startswith("{") or line.strip().startswith("["):
-                for j in range(len(lines) - 1, i - 1, -1):
-                    if lines[j].strip().endswith("}") or lines[j].strip().endswith("]"):
-                        potential_json = "\n".join(lines[i : j + 1])
-                        try:
-                            return json.loads(potential_json.strip())
-                        except json.JSONDecodeError:
-                            continue
+        for fragment in _iter_json_fragments(text):
+            if fragment is not None:
+                return fragment
 
         return None
 
@@ -360,28 +372,40 @@ class DualAPILLMNode:
                 "error": f"Payload não serializável: {serialization_error}",
             }
 
+        attempts = max(1, int(max_retries))
+        session = _get_http_session(provider)
+        request_timeout = float(timeout)
         last_error = ""
 
-        for attempt in range(max_retries):
+        for attempt in range(1, attempts + 1):
             try:
-                response = requests.post(
+                response = session.post(
                     url,
                     headers=headers,
                     json=request_payload,
-                    timeout=timeout,
+                    timeout=request_timeout,
                 )
+            except requests.exceptions.Timeout:
+                last_error = f"Timeout na tentativa {attempt}/{attempts}"
+                if attempt == attempts:
+                    break
+                continue
+            except requests.exceptions.RequestException as exc:
+                last_error = f"Erro de conexão: {str(exc)}"
+                if attempt == attempts:
+                    break
+                continue
+            except Exception as exc:
+                last_error = f"Erro inesperado: {str(exc)}"
+                break
 
+            try:
                 if response.status_code == 200:
                     try:
                         response_data = response.json()
                     except ValueError:
-                        return "", {
-                            "status": "error",
-                            "provider": provider,
-                            "model": payload.get("model", "unknown"),
-                            "error": "Resposta JSON inválida do provedor",
-                            "attempt": attempt + 1,
-                        }
+                        last_error = "Resposta JSON inválida do provedor"
+                        break
 
                     choices = response_data.get("choices") or []
                     if choices:
@@ -393,7 +417,8 @@ class DualAPILLMNode:
                             "model": response_data.get("model", payload.get("model", "unknown")),
                             "tokens_used": response_data.get("usage", {}),
                             "response_time": response.elapsed.total_seconds(),
-                            "attempt": attempt + 1,
+                            "attempt": attempt,
+                            "retries_used": attempt - 1,
                         }
                         request_id = response.headers.get("x-request-id") or response.headers.get("X-Request-Id")
                         if request_id:
@@ -409,24 +434,23 @@ class DualAPILLMNode:
                 else:
                     detail = self._extract_error_detail(response)
                     last_error = f"HTTP {response.status_code}: {detail}"
-
-            except requests.exceptions.Timeout:
-                last_error = f"Timeout na tentativa {attempt + 1}/{max_retries}"
-            except requests.exceptions.RequestException as exc:
-                last_error = f"Erro de conexão: {str(exc)}"
-            except Exception as exc:
-                last_error = f"Erro inesperado: {str(exc)}"
-
-            if attempt < max_retries - 1:
-                wait_time = min(2 ** attempt, 10)
-                time.sleep(wait_time)
+                    if not _should_retry(response.status_code) or attempt == attempts:
+                        break
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after:
+                            last_error += f" (Retry-After: {retry_after})"
+                        break
+                    continue
+            finally:
+                response.close()
 
         return "", {
             "status": "error",
             "provider": provider,
             "model": payload.get("model", "unknown"),
             "error": last_error,
-            "attempts": max_retries,
+            "attempts": attempts,
         }
 
     def execute_api_call(
