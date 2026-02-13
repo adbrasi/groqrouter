@@ -1,15 +1,19 @@
 import json
+import logging
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
 
 
+LOGGER = logging.getLogger(__name__)
 _JSON_DECODER = json.JSONDecoder()
 _SESSION_LOCK = threading.Lock()
 _SESSION_CACHE: Dict[str, requests.Session] = {}
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRY_BASE_DELAY = 0.35
 
 
 def _decode_json(candidate: str) -> Optional[Any]:
@@ -42,7 +46,7 @@ def _get_http_session(provider: str) -> requests.Session:
         session = _SESSION_CACHE.get(key)
         if session is None:
             session = requests.Session()
-            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
             session.mount("https://", adapter)
             session.mount("http://", adapter)
             _SESSION_CACHE[key] = session
@@ -53,10 +57,10 @@ def _should_retry(status_code: int) -> bool:
     return status_code in _RETRYABLE_STATUS_CODES or status_code >= 500
 
 
-class DualAPILLMNode:
+class OpenRouterLLMNode:
     """
-    ComfyUI custom node that routes chat completion requests between Groq and OpenRouter
-    with robust JSON parsing and defensive error handling.
+    ComfyUI custom node for OpenRouter chat completions with robust JSON parsing,
+    multimodal image support, and configurable reasoning effort.
     """
 
     def __init__(self):
@@ -66,17 +70,29 @@ class DualAPILLMNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_provider": (["groq", "openrouter"], {"default": "groq"}),
                 "api_key": ("STRING", {"multiline": False, "default": ""}),
                 "system_prompt": (
                     "STRING",
                     {
                         "multiline": True,
-                        "default": "You are a helpful assistant. Always respond with valid JSON format.",
+                        "default": (
+                            "You are a structured output assistant. "
+                            "Return exactly one valid JSON object and nothing else. "
+                            "Do not wrap JSON in markdown fences."
+                        ),
                     },
                 ),
                 "user_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "model": ("STRING", {"multiline": False, "default": "llama-3.3-70b-versatile"}),
+                "user_image": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                    },
+                ),
+                "reasoning_level": (["low", "medium", "high"], {"default": "low"}),
+                "max_tokens": ("INT", {"default": 0, "min": 0, "max": 128000}),
+                "model": ("STRING", {"multiline": False, "default": "x-ai/grok-4.1-fast"}),
             },
             "optional": {
                 "custom_parameters": ("STRING", {"multiline": True, "default": "{}"}),
@@ -102,9 +118,6 @@ class DualAPILLMNode:
     CATEGORY = "LLM/API"
 
     def parse_json_from_response(self, text: str) -> Optional[Any]:
-        """
-        Attempt to extract JSON content from model responses with minimal overhead.
-        """
         if not text:
             return None
 
@@ -112,6 +125,20 @@ class DualAPILLMNode:
         direct_match = _decode_json(stripped)
         if direct_match is not None:
             return direct_match
+
+        if "```" in text:
+            start = text.find("```")
+            while start != -1:
+                end = text.find("```", start + 3)
+                if end == -1:
+                    break
+                block = text[start + 3 : end].strip()
+                if block.lower().startswith("json"):
+                    block = block[4:].strip()
+                block_match = _decode_json(block)
+                if block_match is not None:
+                    return block_match
+                start = text.find("```", end + 3)
 
         for fragment in _iter_json_fragments(text):
             if fragment is not None:
@@ -151,6 +178,48 @@ class DualAPILLMNode:
             return json.dumps(value)
         except (TypeError, ValueError):
             return str(value)
+
+    def _extract_text_from_content(self, content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, (int, float, bool)):
+            return str(content)
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = str(item.get("type", "")).lower()
+                    if item_type in {"text", "output_text", "input_text"}:
+                        text_value = item.get("text")
+                        if text_value is not None:
+                            chunks.append(self._stringify_value(text_value))
+                    elif "text" in item:
+                        chunks.append(self._stringify_value(item.get("text")))
+                elif item is not None:
+                    chunks.append(self._stringify_value(item))
+            return "\n".join(chunk for chunk in chunks if chunk)
+        if isinstance(content, dict):
+            if "text" in content:
+                return self._stringify_value(content.get("text"))
+            return self._stringify_value(content)
+        return self._stringify_value(content)
+
+    def _extract_text_from_message(self, message: Any) -> str:
+        if not isinstance(message, dict):
+            return self._stringify_value(message)
+
+        direct_content = self._extract_text_from_content(message.get("content"))
+        if direct_content:
+            return direct_content
+
+        for field in ("output_text", "reasoning"):
+            value = message.get(field)
+            if value:
+                return self._stringify_value(value)
+
+        return ""
 
     def extract_value_strings(self, data: Any, limit: int = 7) -> List[str]:
         values: List[str] = []
@@ -192,10 +261,64 @@ class DualAPILLMNode:
             sanitized[str(key)] = value
         return sanitized
 
+    def _parse_image_inputs(self, user_image: Any) -> List[str]:
+        if user_image is None:
+            return []
+
+        if isinstance(user_image, dict):
+            if isinstance(user_image.get("url"), str):
+                return [user_image["url"].strip()] if user_image["url"].strip() else []
+            image_obj = user_image.get("image_url")
+            if isinstance(image_obj, dict) and isinstance(image_obj.get("url"), str):
+                return [image_obj["url"].strip()] if image_obj["url"].strip() else []
+            if isinstance(image_obj, str):
+                cleaned = image_obj.strip()
+                return [cleaned] if cleaned else []
+            return []
+
+        if isinstance(user_image, (list, tuple)):
+            urls: List[str] = []
+            for item in user_image:
+                urls.extend(self._parse_image_inputs(item))
+            return urls
+
+        if isinstance(user_image, str):
+            stripped = user_image.strip()
+            if not stripped:
+                return []
+
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        urls: List[str] = []
+                        for item in parsed:
+                            urls.extend(self._parse_image_inputs(item))
+                        return urls
+                except json.JSONDecodeError:
+                    pass
+
+            if "\n" in stripped and not stripped.startswith("data:"):
+                return [line.strip() for line in stripped.splitlines() if line.strip()]
+
+            return [stripped]
+
+        return [self._stringify_value(user_image)]
+
+    def _normalize_reasoning_level(self, reasoning_level: Any) -> str:
+        level = str(reasoning_level or "low").strip().lower()
+        if level in {"low", "medium", "high"}:
+            return level
+        return "low"
+
     def prepare_messages(
-        self, system_prompt: Any, user_prompt: Any, extra_messages: Optional[Any] = None
-    ) -> List[Dict[str, str]]:
-        messages: List[Dict[str, str]] = []
+        self,
+        system_prompt: Any,
+        user_prompt: Any,
+        user_image: Optional[Any] = None,
+        extra_messages: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
 
         system_prompt_text = ""
         if isinstance(system_prompt, str):
@@ -206,20 +329,54 @@ class DualAPILLMNode:
         if system_prompt_text:
             messages.append({"role": "system", "content": system_prompt_text})
 
-        combined_sequence: List[Any] = self._coerce_prompt_sequence(user_prompt)
-        if extra_messages is not None:
-            combined_sequence.extend(self._coerce_prompt_sequence(extra_messages))
-
-        if not combined_sequence:
-            raise ValueError("User prompt não fornecido")
-
-        for entry in combined_sequence:
+        user_sequence: List[Any] = self._coerce_prompt_sequence(user_prompt)
+        for entry in user_sequence:
             if isinstance(entry, dict) and "content" in entry:
-                role = entry.get("role", "user")
+                role = str(entry.get("role", "user")).strip() or "user"
                 content = entry.get("content", "")
-                messages.append({"role": str(role), "content": self._stringify_value(content)})
+                if isinstance(content, (list, dict)):
+                    messages.append({"role": role, "content": content})
+                else:
+                    messages.append({"role": role, "content": self._stringify_value(content)})
             else:
-                messages.append({"role": "user", "content": self._stringify_value(entry)})
+                text = self._stringify_value(entry)
+                if text:
+                    messages.append({"role": "user", "content": text})
+
+        image_urls = self._parse_image_inputs(user_image)
+        for image_url in image_urls:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url,
+                            },
+                        }
+                    ],
+                }
+            )
+
+        if extra_messages is not None:
+            extra_sequence = self._coerce_prompt_sequence(extra_messages)
+            for entry in extra_sequence:
+                if isinstance(entry, dict) and "content" in entry:
+                    role = str(entry.get("role", "user")).strip() or "user"
+                    content = entry.get("content", "")
+                    if isinstance(content, (list, dict)):
+                        messages.append({"role": role, "content": content})
+                    else:
+                        messages.append({"role": role, "content": self._stringify_value(content)})
+                else:
+                    text = self._stringify_value(entry)
+                    if text:
+                        messages.append({"role": "user", "content": text})
+
+        has_user_content = any(message.get("role") == "user" for message in messages)
+        if not has_user_content:
+            raise ValueError("User prompt não fornecido")
 
         return messages
 
@@ -279,105 +436,93 @@ class DualAPILLMNode:
         text = (response.text or "").strip()
         return text[:500]
 
+    def _resolve_retry_delay(self, response: requests.Response, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                parsed = float(retry_after)
+                if parsed > 0:
+                    return min(parsed, 10.0)
+            except ValueError:
+                pass
+        return min(_RETRY_BASE_DELAY * attempt, 3.0)
+
     def build_request_payload(
-        self, provider: str, model: str, messages: List[Dict[str, str]], custom_params: Dict[str, Any]
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        reasoning_level: str,
+        max_tokens: int,
+        custom_params: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], List[str], Dict[str, Any]]:
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
+            "reasoning": {"effort": reasoning_level},
         }
+        if int(max_tokens) > 0:
+            payload["max_tokens"] = int(max_tokens)
 
         if not custom_params:
             return payload, [], {}
 
         applied: List[str] = []
         ignored: Dict[str, Any] = {}
+        reserved_keys = {"messages", "model"}
 
-        base_params = {
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
-            "top_a",
-            "frequency_penalty",
-            "presence_penalty",
-            "repetition_penalty",
-            "max_tokens",
-            "stop",
-            "stream",
-            "n",
-            "logprobs",
-            "top_logprobs",
-            "logit_bias",
-            "response_format",
-            "seed",
-            "tools",
-            "tool_choice",
-            "functions",
-            "function_call",
-            "metadata",
-            "user",
-            "reasoning_effort",
-            "parallel_tool_calls",
-        }
-        if provider == "groq":
-            base_params.update({"safety", "structured_output"})
+        custom_reasoning = custom_params.pop("reasoning", None)
+        custom_reasoning_effort = custom_params.pop("reasoning_effort", None)
+        custom_max_tokens = custom_params.pop("max_tokens", None)
+
+        if isinstance(custom_reasoning, dict):
+            payload["reasoning"] = custom_reasoning
+            if "effort" not in payload["reasoning"]:
+                payload["reasoning"]["effort"] = reasoning_level
+            applied.append("reasoning")
+        elif isinstance(custom_reasoning_effort, str) and custom_reasoning_effort.strip():
+            payload["reasoning"] = {"effort": custom_reasoning_effort.strip().lower()}
+            applied.append("reasoning_effort")
+
+        if custom_max_tokens is not None:
+            ignored["max_tokens"] = custom_max_tokens
 
         for key, value in custom_params.items():
-            if key == "messages":
-                continue
-            if key in base_params:
-                payload[key] = value
-                applied.append(key)
-            elif provider == "openrouter":
-                payload[key] = value
-                applied.append(key)
-            else:
+            if key in reserved_keys:
                 ignored[key] = value
+                continue
+            payload[key] = value
+            applied.append(key)
 
         return payload, applied, ignored
 
     def make_api_request(
-        self, provider: str, api_key: str, payload: Dict[str, Any], timeout: int, max_retries: int
+        self, api_key: str, payload: Dict[str, Any], timeout: int, max_retries: int
     ) -> Tuple[str, Dict[str, Any]]:
-        if provider == "groq":
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-        elif provider == "openrouter":
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://comfyui-custom-node",
-                "X-Title": "ComfyUI Custom LLM Node",
-            }
-        else:
-            return "", {
-                "status": "error",
-                "provider": provider,
-                "model": payload.get("model", "unknown"),
-                "error": f"Provider '{provider}' não suportado",
-            }
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://comfyui-custom-node",
+            "X-Title": "ComfyUI OpenRouter Node",
+        }
 
         try:
             request_payload = json.loads(json.dumps(payload))
         except (TypeError, ValueError) as serialization_error:
             return "", {
                 "status": "error",
-                "provider": provider,
+                "provider": "openrouter",
                 "model": payload.get("model", "unknown"),
                 "error": f"Payload não serializável: {serialization_error}",
             }
 
         attempts = max(1, int(max_retries))
-        session = _get_http_session(provider)
+        session = _get_http_session("openrouter")
         request_timeout = float(timeout)
         last_error = ""
 
         for attempt in range(1, attempts + 1):
+            LOGGER.debug("OpenRouter request attempt=%s model=%s", attempt, payload.get("model", ""))
             try:
                 response = session.post(
                     url,
@@ -387,14 +532,16 @@ class DualAPILLMNode:
                 )
             except requests.exceptions.Timeout:
                 last_error = f"Timeout na tentativa {attempt}/{attempts}"
-                if attempt == attempts:
-                    break
-                continue
+                if attempt < attempts:
+                    time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
+                    continue
+                break
             except requests.exceptions.RequestException as exc:
                 last_error = f"Erro de conexão: {str(exc)}"
-                if attempt == attempts:
-                    break
-                continue
+                if attempt < attempts:
+                    time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
+                    continue
+                break
             except Exception as exc:
                 last_error = f"Erro inesperado: {str(exc)}"
                 break
@@ -405,49 +552,61 @@ class DualAPILLMNode:
                         response_data = response.json()
                     except ValueError:
                         last_error = "Resposta JSON inválida do provedor"
+                        if attempt < attempts:
+                            time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
+                            continue
                         break
 
                     choices = response_data.get("choices") or []
                     if choices:
-                        choice = choices[0]
-                        message_content = choice.get("message", {}).get("content", "") or ""
+                        choice = choices[0] if isinstance(choices[0], dict) else {}
+                        message = choice.get("message", {}) if isinstance(choice, dict) else {}
+                        message_content = self._extract_text_from_message(message)
+
                         status_info: Dict[str, Any] = {
                             "status": "success",
-                            "provider": provider,
+                            "provider": "openrouter",
                             "model": response_data.get("model", payload.get("model", "unknown")),
                             "tokens_used": response_data.get("usage", {}),
                             "response_time": response.elapsed.total_seconds(),
                             "attempt": attempt,
                             "retries_used": attempt - 1,
                         }
+
                         request_id = response.headers.get("x-request-id") or response.headers.get("X-Request-Id")
                         if request_id:
                             status_info["request_id"] = request_id
                         if response_data.get("id"):
                             status_info["response_id"] = response_data["id"]
-                        finish_reason = choice.get("finish_reason")
+
+                        finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
                         if finish_reason:
                             status_info["finish_reason"] = finish_reason
+
+                        reasoning = message.get("reasoning") if isinstance(message, dict) else None
+                        if reasoning:
+                            status_info["reasoning"] = reasoning
+
                         return message_content, status_info
 
                     last_error = "Resposta inválida do provedor: campo 'choices' ausente ou vazio"
-                else:
-                    detail = self._extract_error_detail(response)
-                    last_error = f"HTTP {response.status_code}: {detail}"
-                    if not _should_retry(response.status_code) or attempt == attempts:
-                        break
-                    if response.status_code == 429:
-                        retry_after = response.headers.get("Retry-After")
-                        if retry_after:
-                            last_error += f" (Retry-After: {retry_after})"
-                        break
+                    if attempt < attempts:
+                        time.sleep(min(_RETRY_BASE_DELAY * attempt, 2.0))
+                        continue
+                    break
+
+                detail = self._extract_error_detail(response)
+                last_error = f"HTTP {response.status_code}: {detail}"
+                if _should_retry(response.status_code) and attempt < attempts:
+                    time.sleep(self._resolve_retry_delay(response, attempt))
                     continue
+                break
             finally:
                 response.close()
 
         return "", {
             "status": "error",
-            "provider": provider,
+            "provider": "openrouter",
             "model": payload.get("model", "unknown"),
             "error": last_error,
             "attempts": attempts,
@@ -455,21 +614,25 @@ class DualAPILLMNode:
 
     def execute_api_call(
         self,
-        api_provider: str,
         api_key: str,
         system_prompt: str,
         user_prompt: Any,
+        user_image: Any,
+        reasoning_level: str,
+        max_tokens: int,
         model: str,
         custom_parameters: Any = "{}",
         timeout: int = 60,
         max_retries: int = 3,
     ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
+        provider_name = "openrouter"
+
         try:
             if not str(api_key or "").strip():
                 status = {
                     "status": "error",
                     "error": "API key não fornecida",
-                    "provider": api_provider,
+                    "provider": provider_name,
                 }
                 return self._finalize_outputs("", "", [], status)
 
@@ -482,7 +645,7 @@ class DualAPILLMNode:
                         status = {
                             "status": "error",
                             "error": f"Parâmetros customizados inválidos: {decode_error}",
-                            "provider": api_provider,
+                            "provider": provider_name,
                         }
                         return self._finalize_outputs("", "", [], status)
             elif isinstance(custom_parameters, dict):
@@ -492,37 +655,49 @@ class DualAPILLMNode:
                 status = {
                     "status": "error",
                     "error": "Parâmetros customizados devem ser um objeto JSON",
-                    "provider": api_provider,
+                    "provider": provider_name,
                 }
                 return self._finalize_outputs("", "", [], status)
 
+            normalized_reasoning_level = self._normalize_reasoning_level(reasoning_level)
+
             custom_params = self.sanitize_custom_parameters(custom_params_raw)
             custom_params = dict(custom_params)
-
             extra_messages = custom_params.pop("messages", None)
 
             try:
-                messages = self.prepare_messages(system_prompt, user_prompt, extra_messages)
+                messages = self.prepare_messages(system_prompt, user_prompt, user_image, extra_messages)
             except ValueError as missing_prompt:
                 status = {
                     "status": "error",
                     "error": str(missing_prompt),
-                    "provider": api_provider,
+                    "provider": provider_name,
                 }
                 return self._finalize_outputs("", "", [], status)
 
             payload, applied_params, ignored_params = self.build_request_payload(
-                api_provider, model, messages, custom_params
+                model, messages, normalized_reasoning_level, max_tokens, custom_params
             )
 
-            response_content, status_data = self.make_api_request(
-                api_provider, api_key, payload, timeout, max_retries
-            )
+            response_content, status_data = self.make_api_request(api_key, payload, timeout, max_retries)
 
             status_data = status_data or {}
-            status_data.setdefault("provider", api_provider)
+            status_data.setdefault("provider", provider_name)
             status_data.setdefault("model", payload.get("model", model))
             status_data["message_count"] = len(messages)
+            status_data["reasoning_level"] = normalized_reasoning_level
+            status_data["max_tokens"] = int(max_tokens)
+            status_data["image_message_count"] = sum(
+                1
+                for message in messages
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), list)
+                and any(
+                    isinstance(item, dict) and item.get("type") == "image_url"
+                    for item in message.get("content", [])
+                )
+            )
+
             if applied_params:
                 status_data["applied_params"] = applied_params
             if ignored_params:
@@ -550,15 +725,17 @@ class DualAPILLMNode:
             status = {
                 "status": "error",
                 "error": f"Erro interno: {str(exc)}",
-                "provider": api_provider,
+                "provider": provider_name,
             }
             return self._finalize_outputs("", "", [], status)
 
 
 NODE_CLASS_MAPPINGS = {
-    "DualAPILLMNode": DualAPILLMNode,
+    "OpenRouterLLMNode": OpenRouterLLMNode,
+    "DualAPILLMNode": OpenRouterLLMNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DualAPILLMNode": "Groq/OpenRouter",
+    "OpenRouterLLMNode": "OpenRouter (Vision + Reasoning)",
+    "DualAPILLMNode": "OpenRouter (Vision + Reasoning)",
 }
